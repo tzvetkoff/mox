@@ -147,6 +147,7 @@ func monitorDNSBL(log mlog.Log) {
 
 // also see localserve.go, code is similar or even shared.
 func cmdServe(c *cmd) {
+	c.params = "[-unprivileged]"
 	c.help = `Start mox, serving SMTP/IMAP/HTTPS.
 
 Incoming email is accepted over SMTP. Email can be retrieved by users using
@@ -156,9 +157,16 @@ requested, other TLS certificates are requested on demand.
 
 Only implemented on unix systems, not Windows.
 `
+	var unprivileged bool
+	c.flag.BoolVar(&unprivileged, "unprivileged", false, "run mox as unprivileged user")
 	args := c.Parse()
 	if len(args) != 0 {
 		c.Usage()
+	}
+
+	// When running as unprivileged user, we don't need to pass files through environment variables to child.
+	if unprivileged {
+		mox.FilesImmediate = true
 	}
 
 	// Set debug logging until config is fully loaded.
@@ -210,7 +218,10 @@ Only implemented on unix systems, not Windows.
 			}
 		}
 	} else {
-		mox.RestorePassedFiles()
+		if !unprivileged {
+			mox.RestorePassedFiles()
+		}
+
 		mox.MustLoadConfig(true, checkACMEHosts)
 		log.Print("starting as unprivileged user",
 			slog.String("user", mox.Conf.Static.User),
@@ -219,7 +230,7 @@ Only implemented on unix systems, not Windows.
 			slog.Any("pid", os.Getpid()))
 	}
 
-	syscall.Umask(syscall.Umask(007) | 007)
+	syscall.Umask(syscall.Umask(0o07) | 0o07)
 
 	// Initialize key and random buffer for creating opaque SMTP
 	// transaction IDs based on "cid"s.
@@ -230,7 +241,7 @@ Only implemented on unix systems, not Windows.
 		if _, err := cryptorand.Read(recvidbuf); err != nil {
 			log.Fatalx("reading random recvid data", err)
 		}
-		if err := os.WriteFile(recvidpath, recvidbuf, 0660); err != nil {
+		if err := os.WriteFile(recvidpath, recvidbuf, 0o660); err != nil {
 			log.Fatalx("writing recvidpath", err, slog.String("path", recvidpath))
 		}
 		err := os.Chown(recvidpath, int(mox.Conf.Static.UID), 0)
@@ -238,7 +249,7 @@ Only implemented on unix systems, not Windows.
 			slog.String("path", recvidpath),
 			slog.Any("uid", mox.Conf.Static.UID),
 			slog.Any("gid", 0))
-		err = os.Chmod(recvidpath, 0640)
+		err = os.Chmod(recvidpath, 0o640)
 		log.Check(err, "chmod receveidid.key to 0640", slog.String("path", recvidpath))
 	}
 	if err := mox.ReceivedIDInit(recvidbuf[:16], recvidbuf[16:]); err != nil {
@@ -257,8 +268,7 @@ Only implemented on unix systems, not Windows.
 	// unreachable over its ctl socket, and then fail because the network addresses are
 	// taken.
 	const mtastsdbRefresher = true
-	const skipForkExec = false
-	if err := start(mtastsdbRefresher, !mox.Conf.Static.NoOutgoingDMARCReports, !mox.Conf.Static.NoOutgoingTLSReports, skipForkExec); err != nil {
+	if err := start(mtastsdbRefresher, !mox.Conf.Static.NoOutgoingDMARCReports, !mox.Conf.Static.NoOutgoingTLSReports, unprivileged); err != nil {
 		log.Fatalx("start", err)
 	}
 	log.Print("ready to serve")
@@ -388,7 +398,7 @@ Only implemented on unix systems, not Windows.
 
 	// Remove old temporary files that somehow haven't been cleaned up.
 	tmpdir := mox.DataDirPath("tmp")
-	os.MkdirAll(tmpdir, 0770)
+	os.MkdirAll(tmpdir, 0o770)
 	tmps, err := os.ReadDir(tmpdir)
 	if err != nil {
 		log.Errorx("listing files in tmpdir", err)
@@ -473,9 +483,9 @@ func fixperms(log mlog.Log, workdir, configdir, datadir string, moxuid, moxgid u
 			ch.olduid = st.Uid
 			ch.oldgid = st.Gid
 		}
-		if perm != fi.Mode()&(fs.ModeSetgid|0777) {
+		if perm != fi.Mode()&(fs.ModeSetgid|0o777) {
 			ch.mode = &perm
-			ch.oldmode = fi.Mode() & (fs.ModeSetgid | 0777)
+			ch.oldmode = fi.Mode() & (fs.ModeSetgid | 0o777)
 		}
 		var zerochange change
 		if ch == zerochange {
@@ -503,18 +513,18 @@ func fixperms(log mlog.Log, workdir, configdir, datadir string, moxuid, moxgid u
 	//	$workdir/mox.service (systemd service file, optional) root:root 0644
 
 	const root = 0
-	ensure(workdir, root, moxgid, 0751)
-	fixconfig := ensure(configdir, moxuid, 0, fs.ModeSetgid|0750)
-	fixdata := ensure(datadir, moxuid, 0, fs.ModeSetgid|0750)
+	ensure(workdir, root, moxgid, 0o751)
+	fixconfig := ensure(configdir, moxuid, 0, fs.ModeSetgid|0o750)
+	fixdata := ensure(datadir, moxuid, 0, fs.ModeSetgid|0o750)
 
 	// Binary and systemd service file do not exist (there) when running under docker.
 	binary := filepath.Join(workdir, "mox")
 	if xexists(binary) {
-		ensure(binary, root, moxgid, 0750)
+		ensure(binary, root, moxgid, 0o750)
 	}
 	svc := filepath.Join(workdir, "mox.service")
 	if xexists(svc) {
-		ensure(svc, root, root, 0644)
+		ensure(svc, root, root, 0o644)
 	}
 
 	if len(changes) == 0 {
@@ -567,12 +577,12 @@ func fixperms(log mlog.Log, workdir, configdir, datadir string, moxuid, moxgid u
 					slog.Any("newuid", moxuid),
 					slog.Any("newgid", root))
 			}
-			omode := fi.Mode() & (fs.ModeSetgid | 0777)
+			omode := fi.Mode() & (fs.ModeSetgid | 0o777)
 			var nmode fs.FileMode
 			if fi.IsDir() {
-				nmode = fs.ModeSetgid | 0750
+				nmode = fs.ModeSetgid | 0o750
 			} else {
-				nmode = 0640
+				nmode = 0o640
 			}
 			if omode != nmode {
 				err := os.Chmod(path, nmode)
